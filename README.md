@@ -1,5 +1,16 @@
 # Introduction
 
+Notice: This is a fork of https://github.com/davekats/canvas-student-data-export. The main changes are:
+- Added support for downloading videos in canvas's [Media Gallery] section, including vdieos in:
+  - The Kaltura media system (m3u8 streams),
+  - MP4,
+  - and Youtube
+  file formats.
+- Added support for downloading Group data
+- Added support for downloading "Pages" html captures
+- Added support for concurrent downloading of html captures
+- Improved html capture speed
+
 The Canvas Student Data Export Tool exports nearly all of a student's data from the Instructure Canvas Learning Management System (Canvas LMS).  
 This is useful when you are graduating or leaving your college or university, and would like to have a backup of all the data you had in canvas.
 
@@ -10,12 +21,16 @@ The tool exports the following data:
 - Course Pages
 - Course Files
 - Course Modules
+- Group Files
+- Group Announcements
+- Group Discussions
 - (Optional) HTML snapshots of:
     - Course Home Page
     - Grades Page
     - Assignments
     - Announcements
     - Discussions
+    - Pages
     - Modules
 
 Data is saved in JSON (and optionally HTML) format and organized into folders by academic term and course.
@@ -46,6 +61,7 @@ Example output structure:
         - Sample Page.html
         - Sample Quiz.html
       - modules_list.html
+    - pages/
     - grades.html
     - homepage.html
     - CS 101.json
@@ -53,6 +69,12 @@ Example output structure:
     - ...
 - Spring 2024
   - ...
+- groups/
+  - Group Name/
+    - announcements/
+    - discussions/
+    - files/
+    - homepage.html
 - all_output.json
 
 # Getting Started
@@ -60,6 +82,7 @@ Example output structure:
 ## Dependencies
 - Python 3.8 or newer
 - Node.js 16 or newer (only needed for HTML snapshots)
+- Playwright (only needed for Media Gallery downloads — installed via `pip install -r requirements.txt`)
 
 1.  **Install Python dependencies:**
     ```bash
@@ -97,6 +120,12 @@ COOKIES_PATH: ./cookies.txt
 # COURSES_TO_SKIP:
 #   - 12345
 #   - 67890
+# (Optional) Max number of SingleFile captures to run in parallel. Default: 2. May encounter instability at 4+.
+# SINGLEFILE_CONCURRENCY: 4
+# (Optional) Process only this single course ID (can also be set via --course flag).
+# COURSE_ONLY: 12345
+# (Optional) Path to a Chrome profile directory for Media Gallery downloads.
+# MEDIAGALLERY_PROFILE_DIR: C:\Users\you\AppData\Local\Google\Chrome\User Data\Default
 ```
 
 ### Finding Your Credentials
@@ -108,6 +137,9 @@ COOKIES_PATH: ./cookies.txt
 -   **`CHROME_PATH`** (Optional): The script attempts to auto-detect Chrome/Chromium on Windows, macOS, and Linux. If it fails, you can specify the path here.
 -   **`SINGLEFILE_TIMEOUT`** (Optional): Maximum time in seconds to wait for SingleFile to capture a single HTML page. Default is `60` seconds. If you have a slow connection or a busy computer and see "Capture timeout" errors, increase this value.
 -   **`COURSES_TO_SKIP`** (Optional): A list of course IDs to exclude from the export. To find a course ID, go to the course's homepage and look at the URL for the number that follows `/courses/`.
+-   **`SINGLEFILE_CONCURRENCY`** (Optional): Controls how many HTML pages are captured simultaneously. Higher values are faster but use more memory. Default is `2`.
+-   **`COURSE_ONLY`** (Optional): Process only a single course by ID. Equivalent to passing `--course` on the command line.
+-   **`MEDIAGALLERY_PROFILE_DIR`** (Optional): Chrome profile directory used when downloading Media Gallery videos. Useful if your Canvas session is stored in a specific profile.
 
 ## Running the Exporter
 
@@ -119,13 +151,17 @@ python export.py [options]
 
 **Options:**
 
-| Flag                    | Description                                   | Default            |
-| ----------------------- | --------------------------------------------- | ------------------ |
-| `-c`, `--config <path>` | Path to your YAML credentials file.           | `credentials.yaml` |
-| `-o`, `--output <path>` | Directory to store exported data.             | `./output`         |
-| `--singlefile`          | Enable HTML snapshot capture with SingleFile. | Disabled           |
-| `-v`, `--verbose`       | Enable verbose output for debugging.          | Disabled           |
-| `--version`             | Show the version of the tool and exit.        | N/A                |
+| Flag                    | Description                                                                          | Default            |
+| ----------------------- | ------------------------------------------------------------------------------------ | ------------------ |
+| `-c`, `--config <path>` | Path to your YAML credentials file.                                                  | `credentials.yaml` |
+| `-o`, `--output <path>` | Directory to store exported data.                                                    | `./output`         |
+| `--singlefile`          | Enable HTML snapshot capture with SingleFile.                                        | Disabled           |
+| `--mediagallery`        | Download videos from the course Media Gallery (requires `COOKIES_PATH`).             | Disabled           |
+| `--mediagallery-test`   | Run only the Media Gallery download, skipping all other processing.                  | Disabled           |
+| `--course <id>`         | Only process the course with this ID (useful for testing).                           | All courses        |
+| `--groupsonly`          | Skip course processing and export groups only.                                       | Disabled           |
+| `-v`, `--verbose`       | Enable verbose output for debugging.                                                 | Disabled           |
+| `--version`             | Show the version of the tool and exit.                                               | N/A                |
 
 **Example:**
 
@@ -135,6 +171,9 @@ python export.py
 
 # Run with a custom output directory and enable HTML snapshots
 python export.py -o /path/to/my-canvas-backup --singlefile
+
+# Download media gallery videos only
+python export.py --mediagallery-test
 ```
 
 After the export is complete, the tool will display a detailed summary of all the data that was successfully extracted, including counts of assignments, files, and pages, as well as any warnings or errors encountered.

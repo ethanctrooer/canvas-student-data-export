@@ -4,15 +4,18 @@ import os
 import itertools
 import re
 import string
+import threading
 import unicodedata
 import argparse
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # external
 from bs4 import BeautifulSoup
 from canvasapi import Canvas
 from canvasapi.exceptions import ResourceDoesNotExist, Unauthorized, Forbidden, InvalidAccessToken, CanvasException
-from singlefile import download_page, override_chrome_path, override_singlefile_timeout
+from singlefile import download_page, override_chrome_path, override_singlefile_timeout, shared_chrome_context
+from media_gallery import downloadMediaGallery
 import dateutil.parser
 import jsonpickle
 import requests
@@ -87,8 +90,14 @@ class ExtractionStats:
         self.json_files_created = 0
         self.student_limitation_warnings = 0
         self.error_count = 0
-        
-    def summary(self, dl_location, singlefile_enabled=False):
+        self.errors: list[str] = []
+        self.media_gallery_videos_downloaded = 0
+
+    def add_error(self, msg: str) -> None:
+        self.error_count += 1
+        self.errors.append(msg)
+
+    def summary(self, dl_location, singlefile_enabled=False, mediagallery_enabled=False):
         summary_text = f"""
 Data Extraction Summary:
   • {self.assignments_found} assignments found
@@ -106,6 +115,9 @@ Files Downloaded:
         if singlefile_enabled:
             summary_text += f"\n  • {self.html_pages_downloaded} HTML pages captured"
 
+        if mediagallery_enabled:
+            summary_text += f"\n  • {self.media_gallery_videos_downloaded} media gallery videos downloaded"
+
         summary_text += f"""
 
 Data Exports Created:
@@ -116,10 +128,13 @@ Data Exports Created:
 Student Account Limitations: {self.student_limitation_warnings} (expected)
 Errors Encountered: {self.error_count}
 """
+        if self.errors:
+            summary_text += "\n".join(f"  • {e}" for e in self.errors) + "\n"
         return summary_text
 
 # Global stats tracker
 extraction_stats = ExtractionStats()
+_stats_lock = threading.Lock()
 
 def _load_credentials(path: str) -> dict:
     """Return a dict with API_URL, API_KEY, USER_ID, COOKIES_PATH or empty dict if file missing."""
@@ -150,6 +165,9 @@ MAX_FOLDER_NAME_SIZE = 70
 
 # Global flag to stop HTML downloads if cookies are invalid
 stop_html_downloads = False
+
+# Max simultaneous SingleFile/Chrome captures
+HTML_CAPTURE_CONCURRENCY = 2
 
 
 class moduleItemView():
@@ -273,6 +291,20 @@ class courseView():
         self.announcements = []
         self.discussions = []
         self.modules = []
+
+
+class groupView:
+    def __init__(self, group_id, name, course_code):
+        self.course_id = group_id
+        self.term = "groups"
+        self.course_code = course_code
+        self.name = name
+        self.announcements = []
+        self.discussions = []
+        self.pages = []
+        self.assignments = []
+        self.modules = []
+
 
 def makeValidFilename(input_str):
     if(not input_str):
@@ -421,7 +453,7 @@ def findCourseModules(course, course_view):
                             elif error_type == "not_found":
                                 pass  # Already handled by log_error
                             else:
-                                extraction_stats.error_count += 1
+                                extraction_stats.add_error(f"[{course_view.course_code}] {message}")
                             CanvasErrorHandler.log_error(error_type, message)
 
                     module_view.items.append(module_item_view)
@@ -431,7 +463,7 @@ def findCourseModules(course, course_view):
                     e, "module item processing"
                 )
                 CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
-                extraction_stats.error_count += 1
+                extraction_stats.add_error(f"[{course_view.course_code}] {message}")
 
             module_views.append(module_view)
             extraction_stats.modules_found += 1
@@ -441,7 +473,7 @@ def findCourseModules(course, course_view):
             e, "module processing"
         )
         CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
-        extraction_stats.error_count += 1
+        extraction_stats.add_error(f"[{course_view.course_code}] {message}")
 
     return module_views
 
@@ -478,7 +510,7 @@ def downloadCourseFiles(course, course_view):
                 except Exception as e:
                     error_type, message = CanvasErrorHandler.handle_canvas_exception(e, f"file download for {file.display_name}")
                     CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
-                    extraction_stats.error_count += 1
+                    extraction_stats.add_error(f"[{course_view.course_code}] {message}")
             else:
                 print(f"      ✓ Already exists: {file.display_name}")
 
@@ -489,7 +521,49 @@ def downloadCourseFiles(course, course_view):
         if error_type == "student_limitation":
             extraction_stats.student_limitation_warnings += 1
         else:
-            extraction_stats.error_count += 1
+            extraction_stats.add_error(f"[{course_view.course_code}] {message}")
+        CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
+
+
+def downloadGroupFiles(group, group_view):
+    dl_dir = os.path.join(DL_LOCATION, group_view.term, group_view.course_code)
+
+    if not os.path.exists(dl_dir):
+        os.makedirs(dl_dir)
+
+    try:
+        files = group.get_files()
+        files_list = list(files)
+
+        for file in files_list:
+            file_folder = group.get_folder(file.folder_id)
+
+            folder_dl_dir = os.path.join(dl_dir, makeValidFolderPath(file_folder.full_name))
+
+            if not os.path.exists(folder_dl_dir):
+                os.makedirs(folder_dl_dir)
+
+            dl_path = os.path.join(folder_dl_dir, makeValidFilename(str(file.display_name)))
+
+            print(f"    Downloading: {file.display_name}...")
+            if not os.path.exists(dl_path):
+                try:
+                    file.download(dl_path)
+                    extraction_stats.files_downloaded += 1
+                    print(f"      ✓ Saved: {file.display_name}")
+                except Exception as e:
+                    error_type, message = CanvasErrorHandler.handle_canvas_exception(e, f"file download for {file.display_name}")
+                    CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
+                    extraction_stats.add_error(f"[{group_view.course_code}] {message}")
+            else:
+                print(f"      ✓ Already exists: {file.display_name}")
+
+    except Exception as e:
+        error_type, message = CanvasErrorHandler.handle_canvas_exception(e, "group file download")
+        if error_type == "student_limitation":
+            extraction_stats.student_limitation_warnings += 1
+        else:
+            extraction_stats.add_error(f"[{group_view.course_code}] {message}")
         CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
 
 
@@ -525,7 +599,7 @@ def download_submission_attachments(course, course_view):
                         print(f"      ✓ Saved: {attachment.filename}")
                     except Exception as e:
                         print(f"      ❌ Failed to download {attachment.filename}: {e}")
-                        extraction_stats.error_count += 1
+                        extraction_stats.add_error(f"[{course_view.course_code}] attachment download for {attachment.filename}: {e}")
                 else:
                     print(f"      ✓ Already exists: {attachment.filename}")
 
@@ -548,7 +622,7 @@ def getCoursePageUrls(course):
             )
             CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
             if error_type != "student_limitation":
-                extraction_stats.error_count += 1
+                extraction_stats.add_error(f"[{getattr(course, 'course_code', 'unknown')}] {message}")
             else:
                 extraction_stats.student_limitation_warnings += 1
 
@@ -595,7 +669,7 @@ def findCoursePages(course):
             e, "page download"
         )
         CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
-        extraction_stats.error_count += 1
+        extraction_stats.add_error(f"[{getattr(course, 'course_code', 'unknown')}] {message}")
 
     return page_views
 
@@ -661,8 +735,8 @@ def findCourseAssignments(course):
                             print(f"    Note: Not authorized to download every student's assignment submission. Downloading submission for user {USER_ID} only.")
                     else:
                         CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
-                        extraction_stats.error_count += 1
-                    
+                        extraction_stats.add_error(f"[{getattr(course, 'course_code', 'unknown')}] {message}")
+
                     # Download submission for this user only
                     submissions = [assignment.get_submission(USER_ID)]
                 submissions[0] #throw error if no submissions found at all but without error
@@ -671,13 +745,13 @@ def findCourseAssignments(course):
                     e, "submission retrieval"
                 )
                 CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
-                extraction_stats.error_count += 1
+                extraction_stats.add_error(f"[{getattr(course, 'course_code', 'unknown')}] {message}")
             except Exception as e:
                 error_type, message = CanvasErrorHandler.handle_canvas_exception(
                     e, "submission retrieval"
                 )
                 CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
-                extraction_stats.error_count += 1
+                extraction_stats.add_error(f"[{getattr(course, 'course_code', 'unknown')}] {message}")
             else:
                 try:
                     for submission in submissions:
@@ -735,7 +809,7 @@ def findCourseAssignments(course):
                         e, "submission processing"
                     )
                     CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
-                    extraction_stats.error_count += 1
+                    extraction_stats.add_error(f"[{getattr(course, 'course_code', 'unknown')}] {message}")
 
             assignment_views.append(assignment_view)
             extraction_stats.assignments_found += 1
@@ -744,7 +818,7 @@ def findCourseAssignments(course):
             e, "course assignments processing"
         )
         CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
-        extraction_stats.error_count += 1
+        extraction_stats.add_error(f"[{getattr(course, 'course_code', 'unknown')}] {message}")
 
     return assignment_views
 
@@ -765,7 +839,7 @@ def findCourseAnnouncements(course):
             e, "announcement processing"
         )
         CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
-        extraction_stats.error_count += 1
+        extraction_stats.add_error(f"[{getattr(course, 'course_code', 'unknown')}] {message}")
 
     return announcement_views
 
@@ -855,7 +929,7 @@ def getDiscussionView(discussion_topic):
                     elif error_type == "not_found":
                         pass  # Already handled by log_error
                     else:
-                        extraction_stats.error_count += 1
+                        extraction_stats.add_error(message)
 
                 discussion_view.topic_entries.append(topic_entry_view)
         except Exception as e:
@@ -868,7 +942,7 @@ def getDiscussionView(discussion_topic):
             elif error_type == "not_found":
                 pass  # Already handled by log_error
             else:
-                extraction_stats.error_count += 1
+                extraction_stats.add_error(message)
         
     # Amount of pages  
     discussion_view.amount_pages = int(topic_entries_counter/50) + 1 # Typically 50 topic entries are stored on a page before it creates another page.
@@ -893,7 +967,7 @@ def findCourseDiscussions(course):
             e, "discussion processing"
         )
         CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
-        extraction_stats.error_count += 1
+        extraction_stats.add_error(f"[{getattr(course, 'course_code', 'unknown')}] {message}")
 
     return discussion_views
 
@@ -979,12 +1053,14 @@ def _download_page_if_not_exists(url, output_path, cookies_path, additional_args
         
         try:
             download_page(url, cookies_path, output_dir, filename, additional_args, verbose)
-            extraction_stats.html_pages_downloaded += 1
+            with _stats_lock:
+                extraction_stats.html_pages_downloaded += 1
             print(f"      ✓ Saved: {filename}")
             return True
         except Exception as e:
             print(f"      ❌ Failed: {e}")
-            extraction_stats.error_count += 1
+            with _stats_lock:
+                extraction_stats.add_error(f"HTML download for {filename}: {e}")
             if "Authentication failed" in str(e):
                 print("      Stopping all subsequent HTML downloads.")
                 stop_html_downloads = True
@@ -992,6 +1068,29 @@ def _download_page_if_not_exists(url, output_path, cookies_path, additional_args
     else:
         print(f"      ✓ Already exists: {filename}")
         return True # Return True because the file exists, which is a success condition for the caller
+
+def _run_html_tasks_parallel(tasks):
+    """
+    Download a list of HTML pages in parallel using a thread pool.
+    tasks: list of (url, output_path, cookies_path, additional_args, verbose)
+    Returns: number of pages successfully saved or already existing.
+    """
+    if not tasks:
+        return 0
+    pages_saved = 0
+    with shared_chrome_context(), ThreadPoolExecutor(max_workers=HTML_CAPTURE_CONCURRENCY) as executor:
+        futures = {
+            executor.submit(_download_page_if_not_exists, url, path, cookies, args, verbose): (url, path)
+            for url, path, cookies, args, verbose in tasks
+        }
+        for future in as_completed(futures):
+            try:
+                if future.result():
+                    pages_saved += 1
+            except Exception:
+                pass  # errors already logged inside _download_page_if_not_exists
+    return pages_saved
+
 
 def downloadCourseHTML(api_url, cookies_path, verbose=False):
     if not cookies_path or stop_html_downloads:
@@ -1069,92 +1168,101 @@ def downloadCourseGradesHTML(api_url, course_view, cookies_path, verbose=False):
     return 0
         
 def downloadAssignmentPages(api_url, course_view, cookies_path, verbose=False):
-    pages_saved = 0
-    if not cookies_path or not course_view.assignments or stop_html_downloads:
-        return pages_saved
+    if not cookies_path or stop_html_downloads:
+        return 0
 
     base_assign_dir = os.path.join(DL_LOCATION, course_view.term,
         course_view.course_code, "assignments")
 
-    # Download assignment list page
     assignment_list_path = os.path.join(base_assign_dir, "assignment_list.html")
-    list_url = f"{api_url}/courses/{course_view.course_id}/assignments/"
-    if _download_page_if_not_exists(list_url, assignment_list_path, cookies_path, verbose=verbose):
-        pages_saved += 1
+    list_url = f"{api_url}/courses/{course_view.course_id}/assignments"
+    os.makedirs(base_assign_dir, exist_ok=True)
+    pages_saved = 1 if _download_page_if_not_exists(list_url, assignment_list_path, cookies_path, verbose=verbose) else 0
+
+    if not course_view.assignments:
+        return pages_saved
+
+    tasks = []
 
     for assignment in course_view.assignments:
         assignment_title = makeValidFilename(str(assignment.title))
-        assignment_title = shortenFileName(assignment_title, len(assignment_title) - MAX_FOLDER_NAME_SIZE)  
+        assignment_title = shortenFileName(assignment_title, len(assignment_title) - MAX_FOLDER_NAME_SIZE)
         assign_dir = os.path.join(base_assign_dir, assignment_title)
 
         if assignment.html_url:
             assignment_page_path = os.path.join(assign_dir, "assignment.html")
-            if _download_page_if_not_exists(assignment.html_url, assignment_page_path, cookies_path, verbose=verbose):
-                pages_saved += 1
+            os.makedirs(assign_dir, exist_ok=True)
+            tasks.append((assignment.html_url, assignment_page_path, cookies_path, (), verbose))
 
         for submission in assignment.submissions:
             submission_dir = assign_dir
-
             if len(assignment.submissions) != 1:
                 submission_dir = os.path.join(assign_dir, str(submission.user_id))
 
             if submission.preview_url:
                 submission_page_path = os.path.join(submission_dir, "submission.html")
-                if _download_page_if_not_exists(submission.preview_url, submission_page_path, cookies_path, verbose=verbose):
-                    pages_saved += 1
+                os.makedirs(submission_dir, exist_ok=True)
+                tasks.append((submission.preview_url, submission_page_path, cookies_path, (), verbose))
 
-            if (submission.attempt and submission.attempt > 1 and assignment.updated_url and assignment.html_url 
+            if (submission.attempt and submission.attempt > 1 and assignment.updated_url and assignment.html_url
                 and assignment.html_url.rstrip("/") != assignment.updated_url.rstrip("/")):
                 attempts_dir = os.path.join(assign_dir, "attempts")
-                
+                os.makedirs(attempts_dir, exist_ok=True)
                 for i in range(submission.attempt):
                     filename = f"attempt_{i+1}.html"
                     attempt_path = os.path.join(attempts_dir, filename)
                     attempt_url = f"{assignment.updated_url}/history?version={i+1}"
-                    if _download_page_if_not_exists(attempt_url, attempt_path, cookies_path, verbose=verbose):
-                        pages_saved += 1
-    return pages_saved
+                    tasks.append((attempt_url, attempt_path, cookies_path, (), verbose))
 
-def downloadCourseModulePages(api_url, course_view, cookies_path, verbose=False): 
-    pages_saved = 0
-    if not cookies_path or not course_view.modules or stop_html_downloads:
-        return pages_saved
+    return pages_saved + _run_html_tasks_parallel(tasks)
+
+def downloadCourseModulePages(api_url, course_view, cookies_path, verbose=False):
+    if not cookies_path or stop_html_downloads:
+        return 0
 
     modules_dir = os.path.join(DL_LOCATION, course_view.term,
         course_view.course_code, "modules")
 
-    # Downloads the modules page
     module_list_path = os.path.join(modules_dir, "modules_list.html")
     list_url = f"{api_url}/courses/{course_view.course_id}/modules/"
-    if _download_page_if_not_exists(list_url, module_list_path, cookies_path, verbose=verbose):
-        pages_saved += 1
+    os.makedirs(modules_dir, exist_ok=True)
+    pages_saved = 1 if _download_page_if_not_exists(list_url, module_list_path, cookies_path, verbose=verbose) else 0
+
+    if not course_view.modules:
+        return pages_saved
+
+    tasks = []
 
     for module in course_view.modules:
         for item in module.items:
             module_name = makeValidFilename(str(module.name))
             module_name = shortenFileName(module_name, len(module_name) - MAX_FOLDER_NAME_SIZE)
             items_dir = os.path.join(modules_dir, module_name)
-            
+
             if item.url:
                 filename = makeValidFilename(str(item.title)) + ".html"
                 module_item_path = os.path.join(items_dir, filename)
-                if _download_page_if_not_exists(item.url, module_item_path, cookies_path, verbose=verbose):
-                    pages_saved += 1
-    return pages_saved
+                os.makedirs(items_dir, exist_ok=True)
+                tasks.append((item.url, module_item_path, cookies_path, (), verbose))
+
+    return pages_saved + _run_html_tasks_parallel(tasks)
 
 def downloadCourseAnnouncementPages(api_url, course_view, cookies_path, verbose=False):
-    pages_saved = 0
-    if not cookies_path or not course_view.announcements or stop_html_downloads:
-        return pages_saved
+    if not cookies_path or stop_html_downloads:
+        return 0
 
     base_announce_dir = os.path.join(DL_LOCATION, course_view.term,
         course_view.course_code, "announcements")
 
-    # Download announcement list
     announcement_list_path = os.path.join(base_announce_dir, "announcement_list.html")
-    list_url = f"{api_url}/courses/{course_view.course_id}/announcements/"
-    if _download_page_if_not_exists(list_url, announcement_list_path, cookies_path, verbose=verbose):
-        pages_saved += 1
+    list_url = f"{api_url}/courses/{course_view.course_id}/announcements"
+    os.makedirs(base_announce_dir, exist_ok=True)
+    pages_saved = 1 if _download_page_if_not_exists(list_url, announcement_list_path, cookies_path, verbose=verbose) else 0
+
+    if not course_view.announcements:
+        return pages_saved
+
+    tasks = []
 
     for announcement in course_view.announcements:
         if not announcement.url:
@@ -1163,31 +1271,32 @@ def downloadCourseAnnouncementPages(api_url, course_view, cookies_path, verbose=
         announcements_title = makeValidFilename(str(announcement.title))
         announcements_title = shortenFileName(announcements_title, len(announcements_title) - MAX_FOLDER_NAME_SIZE)
         announce_dir = os.path.join(base_announce_dir, announcements_title)
-
-        if not os.path.exists(announce_dir):
-            os.makedirs(announce_dir)
+        os.makedirs(announce_dir, exist_ok=True)
 
         for i in range(announcement.amount_pages):
             filename = f"announcement_{i+1}.html"
             page_path = os.path.join(announce_dir, filename)
             page_url = f"{announcement.url}/page-{i+1}"
-            if _download_page_if_not_exists(page_url, page_path, cookies_path, verbose=verbose):
-                pages_saved += 1
-    return pages_saved
-        
+            tasks.append((page_url, page_path, cookies_path, (), verbose))
+
+    return pages_saved + _run_html_tasks_parallel(tasks)
+
 def downloadCourseDiscussionPages(api_url, course_view, cookies_path, verbose=False):
-    pages_saved = 0
-    if not cookies_path or not course_view.discussions or stop_html_downloads:
-        return pages_saved
+    if not cookies_path or stop_html_downloads:
+        return 0
 
     base_discussion_dir = os.path.join(DL_LOCATION, course_view.term,
         course_view.course_code, "discussions")
 
-    # Download discussion list
     discussion_list_path = os.path.join(base_discussion_dir, "discussion_list.html")
-    list_url = f"{api_url}/courses/{course_view.course_id}/discussion_topics/"
-    if _download_page_if_not_exists(list_url, discussion_list_path, cookies_path, verbose=verbose):
-        pages_saved += 1
+    list_url = f"{api_url}/courses/{course_view.course_id}/discussion_topics"
+    os.makedirs(base_discussion_dir, exist_ok=True)
+    pages_saved = 1 if _download_page_if_not_exists(list_url, discussion_list_path, cookies_path, verbose=verbose) else 0
+
+    if not course_view.discussions:
+        return pages_saved
+
+    tasks = []
 
     for discussion in course_view.discussions:
         if not discussion.url:
@@ -1196,17 +1305,302 @@ def downloadCourseDiscussionPages(api_url, course_view, cookies_path, verbose=Fa
         discussion_title = makeValidFilename(str(discussion.title))
         discussion_title = shortenFileName(discussion_title, len(discussion_title) - MAX_FOLDER_NAME_SIZE)
         discussion_dir = os.path.join(base_discussion_dir, discussion_title)
-
-        if not os.path.exists(discussion_dir):
-            os.makedirs(discussion_dir)
+        os.makedirs(discussion_dir, exist_ok=True)
 
         for i in range(discussion.amount_pages):
             filename = f"discussion_{i+1}.html"
             page_path = os.path.join(discussion_dir, filename)
             page_url = f"{discussion.url}/page-{i+1}"
-            if _download_page_if_not_exists(page_url, page_path, cookies_path, verbose=verbose):
-                pages_saved += 1
-    return pages_saved
+            tasks.append((page_url, page_path, cookies_path, (), verbose))
+
+    return pages_saved + _run_html_tasks_parallel(tasks)
+
+
+def downloadCourseFilesPage(api_url, course_view, cookies_path, verbose=False):
+    if not cookies_path or stop_html_downloads:
+        return 0
+
+    files_dir = os.path.join(DL_LOCATION, course_view.term,
+        course_view.course_code, "files")
+    files_list_path = os.path.join(files_dir, "files_list.html")
+    list_url = f"{api_url}/courses/{course_view.course_id}/files"
+    os.makedirs(files_dir, exist_ok=True)
+    return 1 if _download_page_if_not_exists(list_url, files_list_path, cookies_path, verbose=verbose) else 0
+
+
+def downloadGroupHomePageHTML(api_url, group_view, cookies_path, verbose=False):
+    if not cookies_path or stop_html_downloads:
+        return 0
+
+    dl_dir = os.path.join(DL_LOCATION, group_view.term, group_view.course_code)
+    homepage_path = os.path.join(dl_dir, "homepage.html")
+    url = f"{api_url}/groups/{group_view.course_id}"
+
+    if _download_page_if_not_exists(url, homepage_path, cookies_path, verbose=verbose):
+        return 1
+    return 0
+
+
+def downloadGroupAnnouncementPages(api_url, group_view, cookies_path, verbose=False):
+    if not cookies_path or stop_html_downloads:
+        return 0
+
+    base_announce_dir = os.path.join(DL_LOCATION, group_view.term,
+        group_view.course_code, "announcements")
+    announcement_list_path = os.path.join(base_announce_dir, "announcement_list.html")
+    list_url = f"{api_url}/groups/{group_view.course_id}/announcements"
+    os.makedirs(base_announce_dir, exist_ok=True)
+    pages_saved = 1 if _download_page_if_not_exists(list_url, announcement_list_path, cookies_path, verbose=verbose) else 0
+
+    tasks = []
+    for announcement in group_view.announcements:
+        if not announcement.url:
+            continue
+        announcements_title = makeValidFilename(str(announcement.title))
+        announcements_title = shortenFileName(announcements_title, len(announcements_title) - MAX_FOLDER_NAME_SIZE)
+        announce_dir = os.path.join(base_announce_dir, announcements_title)
+        os.makedirs(announce_dir, exist_ok=True)
+        for i in range(announcement.amount_pages):
+            filename = f"announcement_{i+1}.html"
+            page_path = os.path.join(announce_dir, filename)
+            page_url = f"{announcement.url}/page-{i+1}"
+            tasks.append((page_url, page_path, cookies_path, (), verbose))
+
+    return pages_saved + _run_html_tasks_parallel(tasks)
+
+
+def downloadGroupDiscussionPages(api_url, group_view, cookies_path, verbose=False):
+    if not cookies_path or stop_html_downloads:
+        return 0
+
+    base_discussion_dir = os.path.join(DL_LOCATION, group_view.term,
+        group_view.course_code, "discussions")
+    discussion_list_path = os.path.join(base_discussion_dir, "discussion_list.html")
+    list_url = f"{api_url}/groups/{group_view.course_id}/discussion_topics"
+    os.makedirs(base_discussion_dir, exist_ok=True)
+    pages_saved = 1 if _download_page_if_not_exists(list_url, discussion_list_path, cookies_path, verbose=verbose) else 0
+
+    tasks = []
+    for discussion in group_view.discussions:
+        if not discussion.url:
+            continue
+        discussion_title = makeValidFilename(str(discussion.title))
+        discussion_title = shortenFileName(discussion_title, len(discussion_title) - MAX_FOLDER_NAME_SIZE)
+        discussion_dir = os.path.join(base_discussion_dir, discussion_title)
+        os.makedirs(discussion_dir, exist_ok=True)
+        for i in range(discussion.amount_pages):
+            filename = f"discussion_{i+1}.html"
+            page_path = os.path.join(discussion_dir, filename)
+            page_url = f"{discussion.url}/page-{i+1}"
+            tasks.append((page_url, page_path, cookies_path, (), verbose))
+
+    return pages_saved + _run_html_tasks_parallel(tasks)
+
+
+def downloadGroupFilesPage(api_url, group_view, cookies_path, verbose=False):
+    if not cookies_path or stop_html_downloads:
+        return 0
+
+    files_dir = os.path.join(DL_LOCATION, group_view.term,
+        group_view.course_code, "files")
+    files_list_path = os.path.join(files_dir, "files_list.html")
+    list_url = f"{api_url}/groups/{group_view.course_id}/files"
+    os.makedirs(files_dir, exist_ok=True)
+    return 1 if _download_page_if_not_exists(list_url, files_list_path, cookies_path, verbose=verbose) else 0
+
+
+def downloadGroupPeoplePage(api_url, group_view, cookies_path, verbose=False):
+    if not cookies_path or stop_html_downloads:
+        return 0
+
+    dl_dir = os.path.join(DL_LOCATION, group_view.term, group_view.course_code)
+    people_path = os.path.join(dl_dir, "people.html")
+    url = f"{api_url}/groups/{group_view.course_id}/users"
+    return 1 if _download_page_if_not_exists(url, people_path, cookies_path, verbose=verbose) else 0
+
+
+# ---------------------------------------------------------------------------
+# Sidebar capture + local link rewriting
+# ---------------------------------------------------------------------------
+
+# Suffixes of course tabs already handled by existing download functions
+_ALREADY_CAPTURED_SUFFIXES = {
+    "", "/grades", "/assignments", "/modules",
+    "/announcements", "/discussion_topics", "/files", "/users",
+}
+
+
+def _build_url_map(api_url, course_view, course_dir, context_type="courses"):
+    """
+    Build a {canvas_url: absolute_local_path} mapping for every Canvas URL we save,
+    covering both full URLs (https://...) and path-only forms (/courses/...).
+    Sidebar-captured pages should be merged in by the caller after this returns.
+    """
+    from urllib.parse import urlparse
+
+    cid = course_view.course_id
+    base = api_url.rstrip("/")
+    m = {}
+
+    def add(path_suffix, local_rel):
+        abs_path = os.path.join(course_dir, local_rel)
+        m[f"{base}/{context_type}/{cid}{path_suffix}"] = abs_path
+        m[f"/{context_type}/{cid}{path_suffix}"] = abs_path
+
+    add("",                    "homepage.html")
+    add("/grades",             "grades.html")
+    add("/assignments",        "assignments/assignment_list.html")
+    add("/modules",            "modules/modules_list.html")
+    add("/announcements",      "announcements/announcement_list.html")
+    add("/discussion_topics",  "discussions/discussion_list.html")
+    add("/files",              "files/files_list.html")
+    add("/users",              "people.html")
+
+    for assignment in course_view.assignments:
+        if not assignment.html_url:
+            continue
+        safe = makeValidFilename(str(assignment.title))
+        safe = shortenFileName(safe, len(safe) - MAX_FOLDER_NAME_SIZE)
+        local = os.path.join(course_dir, "assignments", safe, "assignment.html")
+        m[assignment.html_url] = local
+        m[urlparse(assignment.html_url).path] = local
+
+    for discussion in course_view.discussions:
+        if not discussion.url:
+            continue
+        safe = makeValidFilename(str(discussion.title))
+        safe = shortenFileName(safe, len(safe) - MAX_FOLDER_NAME_SIZE)
+        disc_dir = os.path.join(course_dir, "discussions", safe)
+        # bare topic URL → first page
+        m[discussion.url] = os.path.join(disc_dir, "discussion_1.html")
+        m[urlparse(discussion.url).path] = os.path.join(disc_dir, "discussion_1.html")
+        for i in range(discussion.amount_pages):
+            page_url = f"{discussion.url}/page-{i+1}"
+            local = os.path.join(disc_dir, f"discussion_{i+1}.html")
+            m[page_url] = local
+            m[urlparse(page_url).path] = local
+
+    for announcement in course_view.announcements:
+        if not announcement.url:
+            continue
+        safe = makeValidFilename(str(announcement.title))
+        safe = shortenFileName(safe, len(safe) - MAX_FOLDER_NAME_SIZE)
+        ann_dir = os.path.join(course_dir, "announcements", safe)
+        # bare topic URL → first page
+        m[announcement.url] = os.path.join(ann_dir, "announcement_1.html")
+        m[urlparse(announcement.url).path] = os.path.join(ann_dir, "announcement_1.html")
+        for i in range(announcement.amount_pages):
+            page_url = f"{announcement.url}/page-{i+1}"
+            local = os.path.join(ann_dir, f"announcement_{i+1}.html")
+            m[page_url] = local
+            m[urlparse(page_url).path] = local
+
+    for module in course_view.modules:
+        mod_name = makeValidFilename(str(module.name))
+        mod_name = shortenFileName(mod_name, len(mod_name) - MAX_FOLDER_NAME_SIZE)
+        items_dir = os.path.join(course_dir, "modules", mod_name)
+        for item in module.items:
+            if not item.url:
+                continue
+            filename = makeValidFilename(str(item.title)) + ".html"
+            local = os.path.join(items_dir, filename)
+            m[item.url] = local
+            try:
+                m[urlparse(item.url).path] = local
+            except Exception:
+                pass
+
+    return m
+
+
+def _rewrite_local_links(course_dir, url_map):
+    """
+    Walk every .html file under course_dir and replace Canvas URL href values
+    with relative paths to locally-saved files. Uses fast string replacement to
+    avoid corrupting the large base64-inlined assets SingleFile embeds.
+    """
+    html_files = [
+        os.path.join(root, f)
+        for root, _, files in os.walk(course_dir)
+        for f in files if f.endswith(".html")
+    ]
+    for file_path in html_files:
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="replace") as fh:
+                content = fh.read()
+            changed = False
+            file_dir = os.path.dirname(file_path)
+            for canvas_url, local_abs in url_map.items():
+                if canvas_url not in content:
+                    continue
+                if not os.path.exists(local_abs):
+                    continue  # only rewrite to files we actually saved
+                rel = os.path.relpath(local_abs, file_dir).replace("\\", "/")
+                for quote in ('"', "'"):
+                    old = f"href={quote}{canvas_url}{quote}"
+                    new = f"href={quote}{rel}{quote}"
+                    if old in content:
+                        content = content.replace(old, new)
+                        changed = True
+            if changed:
+                with open(file_path, "w", encoding="utf-8") as fh:
+                    fh.write(content)
+        except Exception as e:
+            print(f"    Warning: could not rewrite links in {file_path}: {e}")
+
+
+def downloadSidebarPages(api_url, course_view, cookies_path, course_dir, verbose=False, context_type="courses"):
+    """
+    Parse the saved homepage.html, find sidebar tab links not already covered
+    by existing download functions, and capture them with SingleFile.
+    Returns a {canvas_url: local_path} dict (both full and path-only forms)
+    for merging into the URL map.
+    """
+    if not cookies_path or stop_html_downloads:
+        return {}
+    homepage_path = os.path.join(course_dir, "homepage.html")
+    if not os.path.exists(homepage_path):
+        return {}
+
+    cid = course_view.course_id
+    base = api_url.rstrip("/")
+    course_prefix = f"/{context_type}/{cid}"
+
+    with open(homepage_path, "r", encoding="utf-8", errors="replace") as fh:
+        soup = BeautifulSoup(fh.read(), "html.parser")
+
+    sidebar = soup.select_one("ul#section-tabs")
+    if not sidebar:
+        return {}
+
+    tasks = []
+    captured = {}
+
+    for a in sidebar.select("a[href]"):
+        href = a["href"]
+        if href.startswith(base):
+            href = href[len(base):]
+        if not href.startswith(course_prefix):
+            continue
+        suffix = href[len(course_prefix):]
+        if suffix.rstrip("/") in _ALREADY_CAPTURED_SUFFIXES:
+            continue
+
+        label = (a.get_text(strip=True) or suffix.strip("/").split("/")[-1] or "page")
+        filename = makeValidFilename(label.lower().replace(" ", "_")) + ".html"
+        local_path = os.path.join(course_dir, filename)
+        full_url = f"{base}{href}"
+
+        captured[full_url] = local_path
+        captured[href] = local_path
+        tasks.append((full_url, local_path, cookies_path, (), verbose))
+
+    if tasks:
+        print(f"  Downloading {len(tasks)} additional sidebar page(s)")
+        _run_html_tasks_parallel(tasks)
+
+    return captured
+
 
 if __name__ == "__main__":
 
@@ -1216,6 +1610,10 @@ if __name__ == "__main__":
     parser.add_argument("-c", "--config", default="credentials.yaml", help="Path to YAML credentials file (default: credentials.yaml)")
     parser.add_argument("-o", "--output", default="./output", help="Directory to store exported data (default: ./output)")
     parser.add_argument("--singlefile", action="store_true", help="Enable HTML snapshot capture with SingleFile.")
+    parser.add_argument("--mediagallery", action="store_true", help="Enable Media Gallery video download (requires COOKIES_PATH).")
+    parser.add_argument("--mediagallery-test", action="store_true", dest="mediagallery_test", help="Run only the Media Gallery download, skipping all other processing (implies --mediagallery).")
+    parser.add_argument("--course", type=int, default=None, help="Only process this course ID (useful for testing).")
+    parser.add_argument("--groupsonly", action="store_true", help="Skip course processing and only export groups.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output for debugging.")
     parser.add_argument("--version", action="version", version="Canvas Student Data Export Tool 1.0")
 
@@ -1228,12 +1626,16 @@ if __name__ == "__main__":
     required = ["API_URL", "API_KEY", "USER_ID"]
     missing = [k for k in required if not creds.get(k)]
 
-    # COOKIES_PATH is required if singlefile is active, but it can be missing.
+    # COOKIES_PATH is required if singlefile or mediagallery is active, but it can be missing.
     if args.singlefile:
         print("Note: --singlefile is enabled. Please ensure your browser cookies")
         print("      are fresh by logging into Canvas and then re-exporting")
         print("      them using the chrome extension right before running this script.\n")
         input("Press Enter to continue...")
+        if "COOKIES_PATH" not in creds or not creds["COOKIES_PATH"]:
+            missing.append("COOKIES_PATH")
+
+    if args.mediagallery:
         if "COOKIES_PATH" not in creds or not creds["COOKIES_PATH"]:
             missing.append("COOKIES_PATH")
 
@@ -1254,9 +1656,16 @@ if __name__ == "__main__":
     COOKIES_PATH = creds.get("COOKIES_PATH", "")
     COURSES_TO_SKIP = creds.get("COURSES_TO_SKIP", [])
 
+    # --course flag overrides COURSE_ONLY from credentials
+    course_only = args.course if args.course is not None else creds.get("COURSE_ONLY")
+    if course_only is not None:
+        course_only = int(course_only)
+
     chrome_path_override = creds.get("CHROME_PATH")
     if chrome_path_override:
         override_chrome_path(chrome_path_override)
+
+    mediagallery_profile_dir = creds.get("MEDIAGALLERY_PROFILE_DIR", "")
 
     # Optional: Override SingleFile capture timeout (in seconds)
     singlefile_timeout_override = creds.get("SINGLEFILE_TIMEOUT")
@@ -1265,6 +1674,15 @@ if __name__ == "__main__":
             override_singlefile_timeout(float(singlefile_timeout_override))
         except (ValueError, TypeError):
             print(f"Warning: Invalid SINGLEFILE_TIMEOUT value in {args.config}; using default.")
+
+    # Optional: Override max simultaneous SingleFile/Chrome captures (default 5)
+    # Lower this (e.g. to 2) if you see capture timeouts on the first course.
+    singlefile_concurrency_override = creds.get("SINGLEFILE_CONCURRENCY")
+    if singlefile_concurrency_override is not None:
+        try:
+            HTML_CAPTURE_CONCURRENCY = max(1, int(singlefile_concurrency_override))
+        except (ValueError, TypeError):
+            print(f"Warning: Invalid SINGLEFILE_CONCURRENCY value in {args.config}; using default.")
 
     # Update output directory
     DL_LOCATION = args.output
@@ -1295,6 +1713,15 @@ if __name__ == "__main__":
  
     all_courses_views = []
 
+    mg_session = None
+    if (args.mediagallery or args.mediagallery_test) and COOKIES_PATH:
+        from media_gallery import MediaGallerySession
+        mg_session = MediaGallerySession(
+            API_URL, API_KEY, COOKIES_PATH, chrome_path_override or "",
+            DL_LOCATION, verbose=args.verbose, profile_dir=mediagallery_profile_dir,
+        )
+        mg_session.open()
+
     print("Getting list of all courses\n")
     courses_list = [
         canvas.get_courses(enrollment_state = "active", include="term"),
@@ -1304,31 +1731,39 @@ if __name__ == "__main__":
     skip = set(COURSES_TO_SKIP)
 
 
-    if COOKIES_PATH and args.singlefile:
-        print("  Downloading course list page")
-        downloadCourseHTML(API_URL, COOKIES_PATH, verbose=args.verbose)
+    if not args.groupsonly:
+        if COOKIES_PATH and args.singlefile:
+            print("  Downloading course list page")
+            downloadCourseHTML(API_URL, COOKIES_PATH, verbose=args.verbose)
 
-    for courses in courses_list:
+    for courses in courses_list if not args.groupsonly else []:
         for course in courses:
-            if course.id in skip or not hasattr(course, "name") or not hasattr(course, "term"):
+            if course.id in skip or (course_only is not None and course.id != course_only) \
+                    or not hasattr(course, "name") or not hasattr(course, "term"):
                 continue
             
             html_pages_saved_in_course = 0
 
             course_view = getCourseView(course)
 
-            all_courses_views.append(course_view)
+            if not args.mediagallery_test:
+                all_courses_views.append(course_view)
 
-            print("  Downloading all files")
-            downloadCourseFiles(course, course_view)
+                print("  Downloading all files")
+                downloadCourseFiles(course, course_view)
 
-            print("  Downloading submission attachments")
-            download_submission_attachments(course, course_view)
+                print("  Downloading submission attachments")
+                download_submission_attachments(course, course_view)
 
-            print("  Getting modules and downloading module files")
-            course_view.modules = findCourseModules(course, course_view)
+                print("  Getting modules and downloading module files")
+                course_view.modules = findCourseModules(course, course_view)
 
-            if COOKIES_PATH and args.singlefile:
+            if mg_session is not None:
+                print("  Downloading media gallery videos")
+                mg_count = mg_session.download_course(course.id, course_view)
+                extraction_stats.media_gallery_videos_downloaded += mg_count
+
+            if not args.mediagallery_test and COOKIES_PATH and args.singlefile:
                 print("  Downloading course home page")
                 html_pages_saved_in_course += downloadCourseHomePageHTML(API_URL, course_view, COOKIES_PATH, verbose=args.verbose)
 
@@ -1347,26 +1782,81 @@ if __name__ == "__main__":
                 print("  Downloading course discussion pages")
                 html_pages_saved_in_course += downloadCourseDiscussionPages(API_URL, course_view, COOKIES_PATH, verbose=args.verbose)
 
-            print("  Exporting all course data")
-            exportAllCourseData(course_view)
-            
-            # Show mini-summary for this course
-            assignments_count = len(course_view.assignments)
-            submissions_count = sum(len(a.submissions) for a in course_view.assignments)
-            modules_count = len(course_view.modules)
-            pages_count = len(course_view.pages)
-            announcements_count = len(course_view.announcements)
-            discussions_count = len(course_view.discussions)
-            
-            print(f"  ✓ Course data exported:")
-            print(f"    • {assignments_count} assignments with {submissions_count} submissions (JSON)")
-            print(f"    • {modules_count} modules (JSON)")
-            print(f"    • {pages_count} pages (JSON)")
-            print(f"    • {announcements_count} announcements (JSON)")
-            print(f"    • {discussions_count} discussions (JSON)")
+                print("  Downloading course files page")
+                html_pages_saved_in_course += downloadCourseFilesPage(API_URL, course_view, COOKIES_PATH, verbose=args.verbose)
+
+                course_dir = os.path.join(DL_LOCATION, course_view.term, course_view.course_code)
+                sidebar_captures = downloadSidebarPages(API_URL, course_view, COOKIES_PATH, course_dir, verbose=args.verbose)
+                url_map = _build_url_map(API_URL, course_view, course_dir)
+                url_map.update(sidebar_captures)
+                print("  Rewriting local links in saved HTML pages")
+                _rewrite_local_links(course_dir, url_map)
+
+            if not args.mediagallery_test:
+                print("  Exporting all course data")
+                exportAllCourseData(course_view)
+
+                # Show mini-summary for this course
+                assignments_count = len(course_view.assignments)
+                submissions_count = sum(len(a.submissions) for a in course_view.assignments)
+                modules_count = len(course_view.modules)
+                pages_count = len(course_view.pages)
+                announcements_count = len(course_view.announcements)
+                discussions_count = len(course_view.discussions)
+
+                print(f"  ✓ Course data exported:")
+                print(f"    • {assignments_count} assignments with {submissions_count} submissions (JSON)")
+                print(f"    • {modules_count} modules (JSON)")
+                print(f"    • {pages_count} pages (JSON)")
+                print(f"    • {announcements_count} announcements (JSON)")
+                print(f"    • {discussions_count} discussions (JSON)")
+                if COOKIES_PATH and args.singlefile:
+                    print(f"    • {html_pages_saved_in_course} HTML snapshots saved")
+                print()
+
+    # Process groups
+    print("Getting list of all groups\n")
+    try:
+        current_user = canvas.get_current_user()
+        for group in current_user.get_groups():
+            if not hasattr(group, "name"):
+                continue
+
+            safe_name = makeValidFilename(group.name)
+            safe_name = shortenFileName(safe_name, len(safe_name) - MAX_FOLDER_NAME_SIZE)
+            gv = groupView(group.id, group.name, safe_name)
+
+            print(f"\nGroup: {group.name}")
+            print("  Downloading all files")
+            downloadGroupFiles(group, gv)
+
             if COOKIES_PATH and args.singlefile:
-                print(f"    • {html_pages_saved_in_course} HTML snapshots saved")
+                html_saved = 0
+                html_saved += downloadGroupHomePageHTML(API_URL, gv, COOKIES_PATH, verbose=args.verbose)
+                html_saved += downloadGroupAnnouncementPages(API_URL, gv, COOKIES_PATH, verbose=args.verbose)
+                html_saved += downloadGroupDiscussionPages(API_URL, gv, COOKIES_PATH, verbose=args.verbose)
+                html_saved += downloadGroupFilesPage(API_URL, gv, COOKIES_PATH, verbose=args.verbose)
+                html_saved += downloadGroupPeoplePage(API_URL, gv, COOKIES_PATH, verbose=args.verbose)
+
+                group_dir = os.path.join(DL_LOCATION, gv.term, gv.course_code)
+                sidebar_captures = downloadSidebarPages(API_URL, gv, COOKIES_PATH, group_dir,
+                                                        verbose=args.verbose, context_type="groups")
+                url_map = _build_url_map(API_URL, gv, group_dir, context_type="groups")
+                url_map.update(sidebar_captures)
+                _rewrite_local_links(group_dir, url_map)
+
+            if mg_session is not None:
+                print("  Downloading media gallery videos")
+                mg_count = mg_session.download_course(group.id, gv, context_type="groups")
+                extraction_stats.media_gallery_videos_downloaded += mg_count
+
             print()
+    except Exception as e:
+        error_type, message = CanvasErrorHandler.handle_canvas_exception(e, "group export")
+        CanvasErrorHandler.log_error(error_type, message, verbose=args.verbose)
+
+    if mg_session is not None:
+        mg_session.close()
 
     print("Exporting data from all courses combined as one file: "
           "all_output.json")
@@ -1381,4 +1871,4 @@ if __name__ == "__main__":
     print(f"Combined JSON data exported to: {all_output_path}")
 
     print("\nProcess complete. All canvas data exported!")
-    print(extraction_stats.summary(DL_LOCATION, singlefile_enabled=args.singlefile))
+    print(extraction_stats.summary(DL_LOCATION, singlefile_enabled=args.singlefile, mediagallery_enabled=args.mediagallery))

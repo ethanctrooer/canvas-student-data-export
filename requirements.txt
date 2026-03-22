@@ -4,3 +4,8 @@ jsonpickle
 canvasapi
 python-dateutil
 PyYAML
+playwright
+aiofiles
+aiohttp
+ffmpeg-python
+m3u8

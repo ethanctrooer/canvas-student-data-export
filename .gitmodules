@@ -1,0 +1,3 @@
+[submodule "m3u8-video-downloader"]
+	path = m3u8-video-downloader
+	url = https://github.com/dennislwy/m3u8-video-downloader.git

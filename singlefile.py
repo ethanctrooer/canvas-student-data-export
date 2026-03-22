@@ -1,7 +1,10 @@
+from contextlib import contextmanager
 from subprocess import CalledProcessError, run
 import os
 import platform
 import shutil
+import socket
+import subprocess
 import time
 
 if platform.system() == "Windows":
@@ -50,6 +53,8 @@ def _detect_chrome_path() -> str:
 # Mutable global – can be overridden at runtime by export.py
 CHROME_PATH = _detect_chrome_path()
 
+# Set by shared_chrome_context() while the shared Chrome instance is running
+_SHARED_CHROME_URL: str | None = None
 
 # Default timeout in seconds for SingleFile to complete. Can be overridden.
 SINGLEFILE_TIMEOUT = 60.0  # 1 minute
@@ -66,6 +71,71 @@ def override_singlefile_timeout(timeout: float):
     global SINGLEFILE_TIMEOUT
     if timeout > 0:
         SINGLEFILE_TIMEOUT = timeout
+
+
+def _find_free_port() -> int:
+    """Return an OS-assigned free TCP port."""
+    with socket.socket() as s:
+        s.bind(('', 0))
+        return s.getsockname()[1]
+
+
+def _wait_for_chrome_ready(port: int, timeout: float = 15) -> None:
+    """Poll Chrome's CDP health endpoint until it responds or timeout elapses."""
+    import urllib.request
+    import urllib.error
+    url = f'http://127.0.0.1:{port}/json/version'
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            urllib.request.urlopen(url, timeout=1)
+            return
+        except Exception:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"Chrome did not become ready on port {port} within {timeout}s")
+            time.sleep(0.25)
+
+
+@contextmanager
+def shared_chrome_context():
+    """
+    Launch a single headless Chrome instance with remote debugging enabled and
+    share it across all SingleFile calls within the context.  Falls back
+    gracefully if Chrome is unavailable.
+    """
+    global _SHARED_CHROME_URL
+    if not CHROME_PATH:
+        yield
+        return
+    port = _find_free_port()
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            [
+                CHROME_PATH,
+                f'--remote-debugging-port={port}',
+                '--headless=new',
+                '--no-first-run',
+                '--no-default-browser-check',
+                '--disable-extensions',
+                '--disable-gpu',
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        _wait_for_chrome_ready(port)
+        _SHARED_CHROME_URL = f'http://127.0.0.1:{port}'
+        yield
+    except Exception:
+        yield  # Chrome failed to start — fall back to per-invocation launch
+    finally:
+        _SHARED_CHROME_URL = None
+        if proc is not None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
 
 
 def addQuotes(str):
@@ -91,11 +161,14 @@ def download_page(url, cookies_path, output_path, output_name_template = "", add
             expected_output,
             "--filename-conflict-action=overwrite",
             "--browser-capture-max-time=" + timeout_ms,
+            "--browser-wait-until=load",
         ]
         if CHROME_PATH:
             cmd_args.append("--browser-executable-path=" + CHROME_PATH.strip("\""))
         if cookies_path:
             cmd_args.append("--browser-cookies-file=" + cookies_path)
+        if _SHARED_CHROME_URL:
+            cmd_args.append(f"--browser-remote-debugging-url={_SHARED_CHROME_URL}")
         # Append any additional CLI args as-is
         cmd_args.extend(list(additional_args))
     else:
@@ -107,11 +180,14 @@ def download_page(url, cookies_path, output_path, output_name_template = "", add
             addQuotes(expected_output),
             "--filename-conflict-action=overwrite",
             "--browser-capture-max-time=" + timeout_ms,
+            "--browser-wait-until=load",
         ]
         if CHROME_PATH:
             args.append("--browser-executable-path=" + addQuotes(CHROME_PATH.strip("\"")))
         if cookies_path:
             args.append("--browser-cookies-file=" + addQuotes(cookies_path))
+        if _SHARED_CHROME_URL:
+            args.append(f"--browser-remote-debugging-url={_SHARED_CHROME_URL}")
         args.extend(additional_args)
         cmd_args = " ".join(args)
 
@@ -145,7 +221,7 @@ def download_page(url, cookies_path, output_path, output_name_template = "", add
                 if not os.path.exists(expected_output):
                     raise FileNotFoundError(expected_output)
                 with open(expected_output, "r", encoding="utf-8") as f:
-                    content = f.read()
+                    content = f.read(4096)
 
                 # Detect login page content
                 login_indicators = [
