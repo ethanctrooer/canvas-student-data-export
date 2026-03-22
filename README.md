@@ -1,5 +1,5 @@
 Notice: This is a fork of https://github.com/davekats/canvas-student-data-export. The main changes are:
-- Added support for downloading videos in canvas's [Media Gallery] section, including vdieos in:
+- Added support for downloading videos in Canvas's [Media Gallery] section, including videos in:
   - The Kaltura media system (m3u8 streams),
   - MP4,
   - and Youtube
