@@ -1,5 +1,3 @@
-# Introduction
-
 Notice: This is a fork of https://github.com/davekats/canvas-student-data-export. The main changes are:
 - Added support for downloading videos in canvas's [Media Gallery] section, including vdieos in:
   - The Kaltura media system (m3u8 streams),
@@ -10,6 +8,8 @@ Notice: This is a fork of https://github.com/davekats/canvas-student-data-export
 - Added support for downloading "Pages" html captures
 - Added support for concurrent downloading of html captures
 - Improved html capture speed
+
+# Introduction
 
 The Canvas Student Data Export Tool exports nearly all of a student's data from the Instructure Canvas Learning Management System (Canvas LMS).  
 This is useful when you are graduating or leaving your college or university, and would like to have a backup of all the data you had in canvas.
