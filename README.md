@@ -95,9 +95,8 @@ Example output structure:
     npm install
     ```
 3.  **Install m3u8 dependencies:**
-    ```bash
+    
     Follow the steps in the [submodule README](https://github.com/dennislwy/m3u8-video-downloader)
-    ```
 
 ## Configuration
 
