@@ -82,7 +82,7 @@ Example output structure:
 ## Dependencies
 - Python 3.8 or newer
 - Node.js 16 or newer (only needed for HTML snapshots)
-- Playwright (only needed for Media Gallery downloads — installed via `pip install -r requirements.txt`)
+- Playwright (only needed for Media Gallery downloads)
 
 1.  **Install Python dependencies:**
     ```bash
@@ -94,6 +94,8 @@ Example output structure:
     ```bash
     npm install
     ```
+3.  **Install m3u8 dependencies:**
+    Follow the steps in the submodule README
 
 ## Configuration
 
