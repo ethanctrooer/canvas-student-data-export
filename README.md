@@ -1,7 +1,5 @@
-# Introduction
-
 Notice: This is a fork of https://github.com/davekats/canvas-student-data-export. The main changes are:
-- Added support for downloading videos in canvas's [Media Gallery] section, including vdieos in:
+- Added support for downloading videos in Canvas's [Media Gallery] section, including videos in:
   - The Kaltura media system (m3u8 streams),
   - MP4,
   - and Youtube
@@ -10,6 +8,8 @@ Notice: This is a fork of https://github.com/davekats/canvas-student-data-export
 - Added support for downloading "Pages" html captures
 - Added support for concurrent downloading of html captures
 - Improved html capture speed
+
+# Introduction
 
 The Canvas Student Data Export Tool exports nearly all of a student's data from the Instructure Canvas Learning Management System (Canvas LMS).  
 This is useful when you are graduating or leaving your college or university, and would like to have a backup of all the data you had in canvas.
@@ -82,7 +82,7 @@ Example output structure:
 ## Dependencies
 - Python 3.8 or newer
 - Node.js 16 or newer (only needed for HTML snapshots)
-- Playwright (only needed for Media Gallery downloads — installed via `pip install -r requirements.txt`)
+- Playwright (only needed for Media Gallery downloads)
 
 1.  **Install Python dependencies:**
     ```bash
@@ -94,6 +94,9 @@ Example output structure:
     ```bash
     npm install
     ```
+3.  **Install m3u8 dependencies:**
+    
+    Follow the steps in the [submodule README](https://github.com/dennislwy/m3u8-video-downloader)
 
 ## Configuration
 
