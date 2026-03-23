@@ -9,3 +9,4 @@ aiofiles
 aiohttp
 ffmpeg-python
 m3u8
+yt-dlp
